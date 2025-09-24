@@ -1,0 +1,194 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Buy&Win — сканирование чека</title>
+<style>
+  body{font-family:Arial,Helvetica,sans-serif; margin:0; padding:12px; background:#f7f7f7; color:#111}
+  h1{font-size:18px;margin:0 0 8px}
+  p.lead{font-size:14px;margin:0 0 12px}
+  #video{width:100%;max-width:640px;border-radius:8px; background:#000}
+  #status{margin-top:12px;font-size:16px}
+  .btn{display:inline-block;padding:10px 14px;border-radius:8px;background:#007bff;color:#fff;text-decoration:none;margin-top:12px}
+  .small{font-size:13px;color:#444}
+  header{display:flex;gap:12px;align-items:center}
+  #container{max-width:720px;margin:0 auto}
+  @media (min-width:720px){ body{padding:24px} h1{font-size:22px} }
+</style>
+</head>
+<body>
+  <div id="container">
+    <header>
+      <div>
+        <h1>Buy&Win — система розыгрышей чеков</h1>
+        <p class="lead">Акция бесплатна. Отсканируйте QR чека камерой телефона — система определит данные и сразу ответит, принят ли чек.</p>
+      </div>
+    </header>
+
+    <video id="video" autoplay playsinline></video>
+    <div id="status">Загрузка камеры...</div>
+    <a id="rules" class="small" href="#" target="_blank">Условия акции</a>
+    <div style="margin-top:8px;"><a id="scanAgain" class="btn" href="javascript:location.reload()">Сканировать снова</a></div>
+  </div>
+
+<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
+<script>
+(async function(){
+  const endpoint = 'https://script.google.com/macros/s/AKfycbyT4f-DC52AdaDqLrPot4ytnZSwIskwTcei93SSTa2y-DB3PP1l7OOmZ3M4vwV99YswuQ/exec
+'; // <<< ЗАМЕНИТЕ на ваш Apps Script WebApp URL
+  const video = document.getElementById('video');
+  const status = document.getElementById('status');
+  const rules = document.getElementById('rules');
+
+  // ссылка на правила (замените на вашу)
+  rules.href = 'https://example.com/rules.pdf';
+
+  // Получаем публичный IP (для throttle по IP)
+  let clientIp = '';
+  try {
+    const r = await fetch('https://api.ipify.org?format=json');
+    const j = await r.json();
+    clientIp = j.ip || '';
+  } catch(e) { clientIp = ''; }
+
+  // Разрешаем камеру
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}, audio:false});
+    video.srcObject = stream;
+    await video.play();
+    status.innerText = 'Наведите камеру на QR чека...';
+    startScanning();
+  } catch(err) {
+    status.innerText = 'Ошибка доступа к камере: ' + err.message;
+    return;
+  }
+
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d');
+  let lastData = null;
+  let busy = false;
+
+  function tick() {
+    if (video.readyState === video.HAVE_ENOUGH_DATA) {
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const imgData = ctx.getImageData(0,0,canvas.width,canvas.height);
+      const code = jsQR(imgData.data, imgData.width, imgData.height, { inversionAttempts: "attemptBoth" });
+      if (code) {
+        if (code.data !== lastData && !busy) {
+          lastData = code.data;
+          handleQR(code.data);
+        }
+      }
+    }
+    requestAnimationFrame(tick);
+  }
+
+  function startScanning(){ requestAnimationFrame(tick); }
+
+  // парсер QR-строки, возвращает объект с fn, fd, fp, sum, date, time, inn, raw
+  function parseReceiptQR(qrText){
+    const out = { raw: qrText, fn:'', fd:'', fp:'', sum:'', date:'', time:'', inn:'' };
+    try {
+      // Берём пары param=value (разделители & ?)
+      const parts = qrText.split(/[&?]/);
+      parts.forEach(p=>{
+        const kv = p.split('=');
+        if(kv.length>=2){
+          const key = kv[0].toLowerCase();
+          const val = kv.slice(1).join('=');
+          if(key==='fn' || key==='fn2') out.fn = val.replace(/\D/g,'');
+          if(key==='i' || key==='fd') out.fd = val.replace(/\D/g,'');
+          if(key==='fp' || key==='fp2') out.fp = val.replace(/\D/g,'');
+          if(key==='s' || key==='sum') out.sum = val.replace(',', '.');
+          if(key==='t' || key==='date') {
+            // возможные форматы: 20250901T12:34, 2025-09-01T12:34, 01.09.2025T12:34
+            out.date = val;
+          }
+          if(key==='n' || key==='inn' || key==='sellerinn') out.inn = val.replace(/\D/g,'');
+        }
+      });
+      // если не распозналось, попытаться регулярками искать fn/fp/fd
+      if(!out.fn){
+        const mfn = qrText.match(/fn=([\d]+)/i) || qrText.match(/fn:([\d]+)/i);
+        if(mfn) out.fn = mfn[1];
+      }
+      if(!out.fd){
+        const mfd = qrText.match(/i=([\d]+)/i) || qrText.match(/fd=([\d]+)/i) || qrText.match(/fiscalDocumentNumber=([\d]+)/i);
+        if(mfd) out.fd = mfd[1];
+      }
+      if(!out.fp){
+        const mfp = qrText.match(/fp=([\d]+)/i) || qrText.match(/fiscalSign=([\d]+)/i);
+        if(mfp) out.fp = mfp[1];
+      }
+      if(!out.sum){
+        const ms = qrText.match(/s=([\d\.,]+)/i);
+        if(ms) out.sum = ms[1].replace(',', '.');
+      }
+      if(!out.inn){
+        const mi = qrText.match(/n=([\d]+)/i) || qrText.match(/inn=([\d]+)/i);
+        if(mi) out.inn = mi[1];
+      }
+      // Разделим дату и время если t содержит T
+      if(out.date && out.date.indexOf('T')!==-1){
+        const sp = out.date.split('T');
+        out.date = sp[0];
+        out.time = sp[1] || '';
+      }
+    } catch(e){
+      // ничего
+    }
+    return out;
+  }
+
+  async function handleQR(qrText){
+    busy = true;
+    status.innerText = 'Декодирование чека...';
+    const parsed = parseReceiptQR(qrText);
+
+    // Отправляем payload на сервер (Apps Script)
+    const payload = {
+      raw: parsed.raw,
+      fn: parsed.fn,
+      fd: parsed.fd,
+      fp: parsed.fp,
+      sum: parsed.sum,
+      date: parsed.date,
+      time: parsed.time,
+      inn: parsed.inn,
+      ip: clientIp
+    };
+
+    status.innerText = 'Отправка данных на проверку...';
+    try {
+      const res = await fetch(endpoint, {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify(payload)
+      });
+      const j = await res.json();
+      if(j && j.result==='ok'){
+        status.innerHTML = '<span style="color:green">✔️ Ваш чек принят к розыгрышу. Сохраните ссылку результатов: <a href="'+(j.resultsLink||'#')+'" target="_blank">посмотреть результаты</a></span>';
+      } else if(j && j.result==='duplicate'){
+        status.innerHTML = '<span style="color:orange">⚠️ Чек уже зарегистрирован ранее.</span>';
+      } else if(j && j.result==='not_client'){
+        status.innerHTML = '<span style="color:red">❌ Данный чек не относится к нашему клиенту.</span>';
+      } else if(j && j.result==='sum_low'){
+        status.innerHTML = '<span style="color:red">❌ Сумма чека меньше требуемой. Отсканируйте другой чек.</span>';
+      } else if(j && j.result==='rate_limited'){
+        status.innerHTML = '<span style="color:red">❌ Превышен лимит регистраций с вашего IP сегодня (макс. 3).</span>';
+      } else {
+        status.innerHTML = '<span style="color:red">Ошибка: ' + (j && j.reason ? j.reason : 'неизвестная') + '</span>';
+      }
+    } catch(err) {
+      status.innerText = 'Ошибка отправки: ' + err;
+    }
+    busy = false;
+  }
+
+})();
+</script>
+</body>
+</html>
